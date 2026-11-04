@@ -1,0 +1,80 @@
+name: Mac DMG
+
+# Makes Vidray_X.Y.Z_universal.dmg from the notarized app in Vidray_X.Y.Z_universal.app.tar.gz,
+# which scripts/release-mac.sh (vidray repo) uploads to the release and then starts this with the
+# archive's SHA-256. The dmg is checked file by file against that app and added to the release.
+# The archive and latest.json are not touched: updates keep using the archive.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version, e.g. 1.0.0'
+        required: true
+      sha256:
+        description: 'SHA-256 of Vidray_<version>_universal.app.tar.gz, as release-mac.sh built it'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  dmg:
+    runs-on: macos-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+      SHA256: ${{ inputs.sha256 }}
+    steps:
+      - name: Download the app archive
+        shell: bash
+        run: |
+          [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $SHA256 =~ ^[0-9a-f]{64}$ ]] || { echo "Bad version or sha256"; exit 1; }
+          gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" --pattern "Vidray_${VERSION}_universal.app.tar.gz" --dir in
+          got=$(shasum -a 256 "in/Vidray_${VERSION}_universal.app.tar.gz" | cut -d ' ' -f 1)
+          echo "release-mac.sh: $SHA256"
+          echo "downloaded:     $got"
+          test "$got" = "$SHA256"
+
+      - name: Make the DMG and check it
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg="Vidray_${VERSION}_universal.dmg"
+          check() {
+            test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$1/Contents/Info.plist")" = "$VERSION"
+            codesign --verify --deep --strict "$1"
+            codesign -dv "$1" 2>&1 | grep -x 'TeamIdentifier=5P427K4T66'
+            spctl -a -t exec -vv "$1"
+            xcrun stapler validate "$1"
+          }
+          hashes() { (cd "$1" && find Vidray.app -type f -print0 | sort -z | xargs -0 shasum -a 256); }
+
+          mkdir app
+          tar -xzf "in/Vidray_${VERSION}_universal.app.tar.gz" -C app
+          check app/Vidray.app
+
+          # A blank image, the app and an Applications link, then compressed: File Arbor's layout.
+          size=$(( $(du -sm app/Vidray.app | cut -f 1) + 20 ))
+          hdiutil create -size "${size}m" -volname Vidray -fs APFS -type UDIF tmp.dmg
+          mkdir mnt
+          hdiutil attach tmp.dmg -mountpoint mnt -noverify -nobrowse
+          ditto app/Vidray.app mnt/Vidray.app
+          ln -s /Applications mnt/Applications
+          sleep 3
+          for i in 1 2 3 4 5; do hdiutil detach mnt && break; sleep 3; done
+          if mount | grep -q " $PWD/mnt "; then hdiutil detach mnt -force; fi
+          hdiutil convert tmp.dmg -format UDZO -o "$dmg"
+
+          mkdir chk
+          hdiutil attach "$dmg" -readonly -noverify -nobrowse -mountpoint chk
+          test -L chk/Applications
+          diff <(hashes app) <(hashes chk)
+          check chk/Vidray.app
+          echo "$(find chk/Vidray.app -type f | wc -l) files, identical to the archive's app"
+          hdiutil detach chk
+          ls -l "$dmg"
+          shasum -a 256 "$dmg"
+
+      - name: Add the DMG to the release
+        run: gh release upload "v$VERSION" "Vidray_${VERSION}_universal.dmg" --repo "$GITHUB_REPOSITORY" --clobber
